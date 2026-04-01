@@ -1,5 +1,5 @@
 """
-文件名管理工具 v2.0.0
+文件名管理工具 v2.1.0
 Tab1: 通用重命名  Tab2: 后缀批量修改  Tab3: 字幕配对
 依赖: pip install tkinterdnd2
 Python 3.12 / tkinter 内置
@@ -13,7 +13,7 @@ except ImportError:
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-import shutil, re
+import shutil, re, uuid
 from pathlib import Path
 
 # ─────────────────────────────────────────────
@@ -67,19 +67,60 @@ def extract_episode(name: str) -> int | None:
 #  公共小部件
 # ─────────────────────────────────────────────
 def make_entry(parent, width=20, placeholder="", **kw) -> tk.Entry:
-    e = tk.Entry(parent, width=width, **ENTRY_CFG, **kw)
-    if placeholder:
-        e.insert(0, placeholder)
-        e.config(fg=MUTED)
-        def _fi(ev, ph=placeholder):
-            if e.get() == ph:
-                e.delete(0, "end"); e.config(fg=TEXT)
-        def _fo(ev, ph=placeholder):
-            if not e.get().strip():
-                e.insert(0, ph); e.config(fg=MUTED)
-        e.bind("<FocusIn>",  _fi)
-        e.bind("<FocusOut>", _fo)
+    # Use unified PlaceholderEntry to track placeholder state reliably
+    e = PlaceholderEntry(parent, width=width, placeholder=placeholder, **kw)
     return e
+
+
+class PlaceholderEntry(tk.Entry):
+    """Entry with placeholder support and explicit placeholder state.
+
+    Methods:
+      - is_placeholder() -> bool
+      - set_text(s) -> set text and mark as non-placeholder
+    """
+    def __init__(self, parent, width=20, placeholder="", **kw):
+        cfg = {**ENTRY_CFG}
+        cfg.update(kw)
+        super().__init__(parent, width=width, **cfg)
+        self._placeholder = str(placeholder) if placeholder is not None else ""
+        self._is_ph = False
+        if self._placeholder:
+            self._set_placeholder()
+        self.bind("<FocusIn>", self._on_focus_in)
+        self.bind("<FocusOut>", self._on_focus_out)
+
+    def _set_placeholder(self):
+        self.delete(0, "end")
+        self.insert(0, self._placeholder)
+        try: self.config(fg=MUTED)
+        except Exception: pass
+        self._is_ph = True
+
+    def _clear_placeholder(self):
+        if self._is_ph:
+            self.delete(0, "end")
+            try: self.config(fg=TEXT)
+            except Exception: pass
+            self._is_ph = False
+
+    def _on_focus_in(self, _ev):
+        if self._is_ph:
+            self._clear_placeholder()
+
+    def _on_focus_out(self, _ev):
+        if not self.get().strip() and self._placeholder:
+            self._set_placeholder()
+
+    def is_placeholder(self) -> bool:
+        return self._is_ph
+
+    def set_text(self, s: str) -> None:
+        self.delete(0, "end")
+        self.insert(0, s)
+        try: self.config(fg=TEXT)
+        except Exception: pass
+        self._is_ph = False
 
 def accent_btn(parent, text, cmd, **kw):
     return tk.Button(parent, text=text, command=cmd,
@@ -211,17 +252,25 @@ class LogMixin:
 #  TAB 1 — 通用重命名
 # ═════════════════════════════════════════════
 class OpRow(tk.Frame):
-    """单条操作行，支持拖拽排序（通过上下按钮模拟）"""
-    TYPES = ["增加前缀", "删除前缀", "增加后缀", "删除后缀", "查找替换", "序号规范化", "自定义正则"]
+    """
+    单条操作行，支持上下移动排序。
+    操作类型：前后标编辑 / 查找替换 / 序号规范化 / 数字补位   （共 4 种）
+
+    前后标编辑布局：
+        前标  [删除输入框]  [增加输入框]
+        后标  [删除输入框]  [增加输入框]
+    执行顺序固定：先删旧 → 再加新，前标先于后标。
+    """
+    TYPES = ["前后标编辑", "查找替换", "序号规范化", "数字补位"]
 
     def __init__(self, parent, on_delete, on_move, refresh_preview, **kw):
         super().__init__(parent, bg=PANEL,
                          highlightthickness=1, highlightbackground=BORDER, **kw)
         self._on_delete = on_delete
-        self._on_move   = on_move          # on_move(self, delta)
+        self._on_move   = on_move
         self._refresh   = refresh_preview
 
-        # 拖拽手柄 + 上下按钮
+        # ── 左侧：上下排序按钮
         grip = tk.Frame(self, bg=PANEL, width=28)
         grip.pack(side="left", fill="y", padx=(4, 0))
         grip.pack_propagate(False)
@@ -232,19 +281,19 @@ class OpRow(tk.Frame):
                   font=("Segoe UI", 8), cursor="hand2",
                   command=lambda: self._on_move(self, +1)).pack(fill="x")
 
-        # 类型下拉
+        # ── 类型下拉
         self.type_var = tk.StringVar(value=self.TYPES[0])
         self._type_cb = ttk.Combobox(self, textvariable=self.type_var,
                                      values=self.TYPES, state="readonly",
-                                     width=14, font=("Segoe UI", 10))
+                                     width=12, font=("Segoe UI", 10))
         self._type_cb.pack(side="left", padx=6, ipady=3)
         self.type_var.trace_add("write", lambda *_: self._rebuild_params())
 
-        # 参数区（动态）
+        # ── 参数区（动态重建）
         self._param_frame = tk.Frame(self, bg=PANEL)
         self._param_frame.pack(side="left", fill="x", expand=True, padx=(0, 4))
 
-        # 删除按钮
+        # ── 右侧：删除按钮
         tk.Button(self, text="✕", bg=PANEL, fg=MUTED, relief="flat",
                   activebackground=ERR_BG, activeforeground=ERR,
                   font=("Segoe UI", 10), cursor="hand2",
@@ -253,85 +302,160 @@ class OpRow(tk.Frame):
         self._widgets: dict = {}
         self._rebuild_params()
 
+    # ── 占位标志位：前后标四个输入框各自维护
+    def _ph_ent(self, parent, ph: str, flag_attr: str, w: int = 20) -> tk.Entry:
+        """Create a PlaceholderEntry and hook refresh events."""
+        e = PlaceholderEntry(parent, width=w, placeholder=ph)
+        e.bind("<KeyRelease>", lambda _: self._refresh())
+        # no separate flag attribute needed; PlaceholderEntry tracks it
+        return e
+
     def _rebuild_params(self):
         for w in self._param_frame.winfo_children():
             w.destroy()
         self._widgets.clear()
         t = self.type_var.get()
 
-        def ent(ph, w=22):
-            e = make_entry(self._param_frame, width=w, placeholder=ph)
-            e.pack(side="left", ipady=3, padx=(0, 6))
-            e.bind("<KeyRelease>", lambda _: self._refresh())
-            return e
+        lbl_cfg = dict(bg=PANEL, fg=MUTED, font=("Segoe UI", 9))
 
-        if t in ("增加前缀", "删除前缀"):
-            self._widgets["text"] = ent("文本，如 [VCB-Studio]")
-        elif t in ("增加后缀", "删除后缀"):
-            self._widgets["text"] = ent("文本，如 [1080p]")
+        if t == "前后标编辑":
+            # 两行：前标行 / 后标行
+            row1 = tk.Frame(self._param_frame, bg=PANEL)
+            row1.pack(fill="x", pady=(2, 1))
+            row2 = tk.Frame(self._param_frame, bg=PANEL)
+            row2.pack(fill="x", pady=(1, 2))
+
+            tk.Label(row1, text="前标", width=4, anchor="w", **lbl_cfg).pack(side="left")
+            tk.Label(row1, text="删除", **lbl_cfg).pack(side="left", padx=(0, 2))
+            self._widgets["pre_del"] = self._ph_ent(row1, "留空则跳过", "_pre_del_ph", 18)
+            self._widgets["pre_del"].pack(side="left", ipady=2, padx=(0, 8))
+            tk.Label(row1, text="增加", **lbl_cfg).pack(side="left", padx=(0, 2))
+            self._widgets["pre_add"] = self._ph_ent(row1, "留空则跳过", "_pre_add_ph", 18)
+            self._widgets["pre_add"].pack(side="left", ipady=2)
+
+            tk.Label(row2, text="后标", width=4, anchor="w", **lbl_cfg).pack(side="left")
+            tk.Label(row2, text="删除", **lbl_cfg).pack(side="left", padx=(0, 2))
+            self._widgets["suf_del"] = self._ph_ent(row2, "留空则跳过", "_suf_del_ph", 18)
+            self._widgets["suf_del"].pack(side="left", ipady=2, padx=(0, 8))
+            tk.Label(row2, text="增加", **lbl_cfg).pack(side="left", padx=(0, 2))
+            self._widgets["suf_add"] = self._ph_ent(row2, "留空则跳过", "_suf_add_ph", 18)
+            self._widgets["suf_add"].pack(side="left", ipady=2)
+
         elif t == "查找替换":
-            self._widgets["find"]    = ent("查找")
-            self._widgets["replace"] = ent("替换为（留空=删除）", 18)
+            def ent(ph, w=24):
+                e = make_entry(self._param_frame, width=w, placeholder=ph)
+                e.pack(side="left", ipady=3, padx=(0, 6))
+                e.bind("<KeyRelease>", lambda _: self._refresh())
+                return e
+            self._widgets["find"]    = ent("查找（正则模式支持捕获组）", 28)
+            self._widgets["replace"] = ent("替换（留空=删除，正则用 \\1）", 28)
             self._widgets["regex"]   = self._check("正则")
+
         elif t == "序号规范化":
-            tk.Label(self._param_frame, text="格式", bg=PANEL, fg=MUTED,
-                     font=("Segoe UI", 9)).pack(side="left")
-            self._widgets["fmt"]    = ent("如 S01E{n:02d}", 16)
-            tk.Label(self._param_frame, text="偏移", bg=PANEL, fg=MUTED,
-                     font=("Segoe UI", 9)).pack(side="left")
-            self._widgets["offset"] = ent("0", 5)
-        elif t == "自定义正则":
-            self._widgets["pattern"] = ent("正则表达式")
-            self._widgets["replace"] = ent("替换（支持 \\1）", 18)
+            lbl_cfg2 = dict(bg=PANEL, fg=MUTED, font=("Segoe UI", 9))
+            def ent2(ph, w=16):
+                e = make_entry(self._param_frame, width=w, placeholder=ph)
+                e.pack(side="left", ipady=3, padx=(0, 6))
+                e.bind("<KeyRelease>", lambda _: self._refresh())
+                return e
+            tk.Label(self._param_frame, text="格式", **lbl_cfg2).pack(side="left", padx=(0, 2))
+            self._widgets["fmt"]    = ent2("如 S01E{n:02d}")
+            tk.Label(self._param_frame, text="偏移", **lbl_cfg2).pack(side="left", padx=(0, 2))
+            self._widgets["offset"] = ent2("0", 5)
+
+        elif t == "数字补位":
+            lbl_cfg3 = dict(bg=PANEL, fg=MUTED, font=("Segoe UI", 9))
+            def ent3(ph, w=6):
+                e = make_entry(self._param_frame, width=w, placeholder=ph)
+                e.pack(side="left", ipady=3, padx=(0, 6))
+                e.bind("<KeyRelease>", lambda _: self._refresh())
+                return e
+            tk.Label(self._param_frame, text="位数", **lbl_cfg3).pack(side="left", padx=(0, 2))
+            self._widgets["pad_width"] = ent3("2", 4)
+            tk.Label(self._param_frame, text="填充字符", **lbl_cfg3).pack(side="left", padx=(0, 2))
+            self._widgets["pad_char"]  = ent3("0", 3)
+            self._widgets["pad_only_pure"] = self._check("仅纯数字文件名")
 
     def _check(self, label):
         var = tk.BooleanVar(value=False)
         tk.Checkbutton(self._param_frame, text=label, variable=var,
                        bg=PANEL, fg=TEXT, font=("Segoe UI", 10),
                        activebackground=PANEL, selectcolor=PANEL,
-                       command=self._refresh).pack(side="left", padx=(0, 6))
+                       command=self._refresh).pack(side="left", padx=(0, 4))
         return var
+
+    def _get(self, key: str) -> str:
+        """读取 Entry 值，占位状态返回空串。"""
+        w = self._widgets[key]
+        if isinstance(w, tk.BooleanVar):
+            return w.get()
+        if isinstance(w, PlaceholderEntry):
+            return "" if w.is_placeholder() else w.get().strip()
+        # fallback for plain Entry
+        try:
+            return w.get().strip()
+        except Exception:
+            return ""
 
     def apply(self, stem: str) -> str:
         """对文件主名（不含扩展名）应用本操作，返回新主名。"""
         t = self.type_var.get()
-        w = self._widgets
-        PH = {e.cget("fg") == MUTED for e in [v for v in w.values() if isinstance(v, tk.Entry)]}
 
-        def val(key):
-            v = w[key]
-            if isinstance(v, tk.BooleanVar): return v.get()
-            s = v.get().strip()
-            return "" if v.cget("fg") == MUTED else s  # 占位文字视为空
+        if t == "前后标编辑":
+            # 顺序：删前标 → 加前标 → 删后标 → 加后标
+            pre_del = self._get("pre_del")
+            pre_add = self._get("pre_add")
+            suf_del = self._get("suf_del")
+            suf_add = self._get("suf_add")
+            if pre_del and stem.startswith(pre_del):
+                stem = stem[len(pre_del):]
+            if pre_add:
+                stem = pre_add + stem
+            if suf_del and stem.endswith(suf_del):
+                stem = stem[:-len(suf_del)]
+            if suf_add:
+                stem = stem + suf_add
+            return stem
 
-        if t == "增加前缀":
-            txt = val("text"); return txt + stem if txt else stem
-        if t == "删除前缀":
-            txt = val("text"); return stem[len(txt):] if txt and stem.startswith(txt) else stem
-        if t == "增加后缀":
-            txt = val("text"); return stem + txt if txt else stem
-        if t == "删除后缀":
-            txt = val("text"); return stem[:-len(txt)] if txt and stem.endswith(txt) else stem
         if t == "查找替换":
-            find = val("find"); repl = val("replace"); use_re = val("regex")
+            find   = self._get("find")
+            repl   = self._get("replace")
+            use_re = self._widgets["regex"].get()
             if not find: return stem
             try:
                 return re.sub(find, repl, stem) if use_re else stem.replace(find, repl)
-            except re.error: return stem
+            except re.error:
+                return stem
+
         if t == "序号规范化":
-            fmt = val("fmt"); off_s = val("offset")
-            ep = extract_episode(stem)
+            fmt   = self._get("fmt")
+            off_s = self._get("offset")
+            ep    = extract_episode(stem)
             if ep is None: return stem
             try:
                 offset = int(off_s) if off_s else 0
                 ep += offset
                 return fmt.format(n=ep) if fmt else stem
-            except Exception: return stem
-        if t == "自定义正则":
-            pat = val("pattern"); repl = val("replace")
-            if not pat: return stem
-            try: return re.sub(pat, repl, stem)
-            except re.error: return stem
+            except Exception:
+                return stem
+
+        if t == "数字补位":
+            width_s   = self._get("pad_width")
+            pad_char  = self._get("pad_char")
+            only_pure = self._widgets["pad_only_pure"].get()
+            try:
+                width = int(width_s) if width_s else 2
+            except ValueError:
+                width = 2
+            # 填充字符只取第一个，默认 '0'
+            ch = pad_char[0] if pad_char else "0"
+            if only_pure:
+                # 仅对纯数字文件名（stem 全为数字）补位
+                return stem.zfill(width) if stem.isdigit() else stem
+            else:
+                # 对 stem 中所有连续数字串补位
+                return re.sub(r'\d+', lambda m: m.group().rjust(width, ch), stem)
+
         return stem
 
 
@@ -360,7 +484,7 @@ class RenameTab(tk.Frame, LogMixin):
         self._file_preview.pack(fill="x", pady=(6,0))
 
         # ── 操作列表
-        ops = section_frame(self, "操作（可拖拽排序）")
+        ops = section_frame(self, "操作")
         self._ops_frame = tk.Frame(ops, bg=PANEL); self._ops_frame.pack(fill="x")
         plain_btn(ops, "+ 添加操作", self._add_op).pack(anchor="w", pady=(6,0))
 
@@ -457,19 +581,50 @@ class RenameTab(tk.Frame, LogMixin):
             messagebox.showwarning("提示", "请先选择文件"); return
         if not self._op_rows:
             messagebox.showwarning("提示", "请至少添加一个操作"); return
+
+        # 预先计算所有 (原路径, 新文件名)
+        plan: list[tuple[Path, str]] = [
+            (p, self._compute_new_name(p)) for p in self._files
+        ]
+
         ok = skip = err = 0
         self.log("─"*60, "head")
-        for path in self._files:
-            new_name = self._compute_new_name(path)
+
+        # ── 阶段一：所有需要改名的文件先 rename 到唯一临时名
+        # 避免同目录内执行顺序导致的名称占用冲突（如 01→E01、E01→E02 互相踩踏）
+        temp_map: list[tuple[Path, Path, str]] = []  # (临时路径, 原路径, 新文件名)
+        for path, new_name in plan:
             if new_name == path.name:
-                self.log(f"  ·  {path.name}  （无变化，跳过）", "info"); skip += 1; continue
-            dst = path.parent / new_name
+                skip += 1; continue
+            tmp = path.parent / f"__tmp_{uuid.uuid4().hex}{path.suffix}"
             try:
-                if dst.exists(): dst = self._resolve_conflict(dst)
-                path.rename(dst)
-                self.log(f"  ✓  {path.name}  →  {new_name}", "ok"); ok += 1
+                path.rename(tmp)
+                temp_map.append((tmp, path, new_name))
             except Exception as e:
-                self.log(f"  ✗  {path.name}  错误: {e}", "err"); err += 1
+                self.log(f"  ✗  {path.name}  临时重命名失败: {e}", "err"); err += 1
+
+        # ── 阶段二：临时名 → 最终目标名
+        for tmp, orig_path, new_name in temp_map:
+            dst = orig_path.parent / new_name
+            try:
+                if dst.exists():
+                    dst = self._resolve_conflict(dst)
+                tmp.rename(dst)
+                self.log(f"  ✓  {orig_path.name}  →  {dst.name}", "ok"); ok += 1
+            except Exception as e:
+                # 回滚：把临时文件改回原名
+                try:
+                    tmp.rename(orig_path)
+                    self.log(f"  ✗  {orig_path.name}  重命名失败（已回滚）: {e}", "err")
+                except Exception as e2:
+                    self.log(f"  ✗  {orig_path.name}  重命名失败且回滚失败: {e} | 回滚错误: {e2}", "err")
+                err += 1
+
+        # 跳过的文件集中输出日志
+        for path, new_name in plan:
+            if new_name == path.name:
+                self.log(f"  ·  {path.name}  （无变化，跳过）", "info")
+
         self.log(f"完成：成功 {ok}  跳过 {skip}  失败 {err}", "head")
         self.log("─"*60, "head")
         self._files.clear(); self._update_file_preview(); self._refresh_preview()
@@ -489,32 +644,45 @@ class RenameTab(tk.Frame, LogMixin):
 class ExtRow(tk.Frame):
     def __init__(self, parent, on_delete, **kw):
         super().__init__(parent, bg=PANEL, **kw)
-        self.src_var = tk.StringVar(); self.dst_var = tk.StringVar(); self.dir_var = tk.StringVar()
-        src = make_entry(self, width=10, placeholder=".zip"); src.pack(side="left", ipady=3, padx=(0,4))
-        tk.Label(self, text="→", bg=PANEL, fg=MUTED, font=("Segoe UI",10)).pack(side="left", padx=(0,4))
-        dst = make_entry(self, width=10, placeholder=".cbz"); dst.pack(side="left", ipady=3, padx=(0,6))
-        self._dir_e = make_entry(self, width=26, placeholder="留空则原地修改")
+        # 用布尔标志追踪占位状态，避免与用户输入内容冲突
+        self._src_ph  = True
+        self._dst_ph  = True
+        self._dir_ph  = True
+
+        self._src_e = self._ph_entry(self, width=10, ph=".zip",          flag_attr="_src_ph")
+        self._src_e.pack(side="left", ipady=3, padx=(0,4))
+        tk.Label(self, text="→", bg=PANEL, fg=MUTED,
+                 font=("Segoe UI",10)).pack(side="left", padx=(0,4))
+        self._dst_e = self._ph_entry(self, width=10, ph=".cbz",          flag_attr="_dst_ph")
+        self._dst_e.pack(side="left", ipady=3, padx=(0,6))
+        self._dir_e = self._ph_entry(self, width=26, ph="留空则原地修改", flag_attr="_dir_ph")
         self._dir_e.pack(side="left", ipady=3, padx=(0,4), expand=True, fill="x")
+
         plain_btn(self, "…", self._browse).pack(side="left", padx=(0,4))
         tk.Button(self, text="✕", bg=PANEL, fg=MUTED, relief="flat",
                   activebackground=ERR_BG, activeforeground=ERR,
                   font=("Segoe UI",10), cursor="hand2",
                   command=on_delete).pack(side="right")
-        self._src_e = src; self._dst_e = dst
+
+    def _ph_entry(self, parent, width, ph, flag_attr) -> tk.Entry:
+        """Create a PlaceholderEntry and return it."""
+        e = PlaceholderEntry(parent, width=width, placeholder=ph)
+        return e
 
     def _browse(self):
         p = filedialog.askdirectory(title="选择目标文件夹")
         if p:
-            self._dir_e.delete(0,"end"); self._dir_e.insert(0,p); self._dir_e.config(fg=TEXT)
-
-    def _val(self, e, ph=""):
-        s = e.get().strip()
-        return "" if (e.cget("fg") == MUTED or s == ph) else s
+            # use set_text to clear placeholder state reliably
+            if isinstance(self._dir_e, PlaceholderEntry):
+                self._dir_e.set_text(p)
+            else:
+                self._dir_e.delete(0, "end"); self._dir_e.insert(0, p)
+            self._dir_ph = False
 
     def get(self):
-        src = self._val(self._src_e, ".zip")
-        dst = self._val(self._dst_e, ".cbz")
-        folder = self._val(self._dir_e, "留空则原地修改")
+        src    = "" if (isinstance(self._src_e, PlaceholderEntry) and self._src_e.is_placeholder()) else self._src_e.get().strip()
+        dst    = "" if (isinstance(self._dst_e, PlaceholderEntry) and self._dst_e.is_placeholder()) else self._dst_e.get().strip()
+        folder = "" if (isinstance(self._dir_e, PlaceholderEntry) and self._dir_e.is_placeholder()) else self._dir_e.get().strip()
         if src and not src.startswith("."): src = "." + src
         if dst and not dst.startswith("."): dst = "." + dst
         return src.lower(), dst, folder
@@ -753,7 +921,8 @@ class SubTab(tk.Frame, LogMixin):
         if not self._videos: messagebox.showwarning("提示","请先选择视频文件"); return
         if not self._subs:   messagebox.showwarning("提示","请先选择字幕文件"); return
         off_s = self._offset_e.get().strip()
-        if self._offset_e.cget("fg") == MUTED: off_s = "0"
+        if isinstance(self._offset_e, PlaceholderEntry) and self._offset_e.is_placeholder():
+            off_s = "0"
         try:    offset = int(off_s)
         except: offset = 0
 
@@ -792,7 +961,7 @@ class SubTab(tk.Frame, LogMixin):
             s_name  = sub.name   if sub   else "（未配对）"
             if video and sub:
                 target = self._target_sub_name(video, sub)
-                tag = "ok" if target != sub.name else "ok"
+                tag = "ok" if target != sub.name else "info"
             elif sub and not video:
                 target = "（跳过）"; tag = "unpaired"
             else:
