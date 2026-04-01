@@ -1,5 +1,5 @@
 """
-文件名管理工具 v2.1.0
+文件名管理工具 v2.1.1
 Tab1: 通用重命名  Tab2: 后缀批量修改  Tab3: 字幕配对
 依赖: pip install tkinterdnd2
 Python 3.12 / tkinter 内置
@@ -14,6 +14,7 @@ except ImportError:
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import shutil, re, uuid
+from datetime import datetime
 from pathlib import Path
 
 # ─────────────────────────────────────────────
@@ -198,13 +199,18 @@ class DropZone(tk.Frame):
     @staticmethod
     def _parse(data):
         paths, data = [], data.strip()
-        while data:
-            if data.startswith("{"):
-                end = data.index("}")
-                paths.append(data[1:end]); data = data[end+1:].strip()
-            else:
-                p = data.split(" ", 1)
-                paths.append(p[0]); data = p[1].strip() if len(p) > 1 else ""
+        try:
+            while data:
+                if data.startswith("{"):
+                    end = data.index("}")
+                    paths.append(data[1:end]); data = data[end+1:].strip()
+                else:
+                    p = data.split(" ", 1)
+                    paths.append(p[0]); data = p[1].strip() if len(p) > 1 else ""
+        except ValueError:
+            # malformed quoted segment; fallback to whitespace-split
+            for part in data.split():
+                paths.append(part)
         return paths
 
 # ─────────────────────────────────────────────
@@ -218,6 +224,20 @@ class LogMixin:
         self._exec_btn = accent_btn(btn_row, "执行", self._execute)
         self._exec_btn.pack(side="left", padx=(0, 8))
         plain_btn(btn_row, "清空日志", self._clear_log).pack(side="left")
+        # Dry-run and optional file logging
+        self._dryrun_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(btn_row, text="仅预览 (Dry-run)", variable=self._dryrun_var,
+                       bg=PANEL, fg=TEXT, font=("Segoe UI", 10),
+                       activebackground=PANEL, selectcolor=PANEL).pack(side="left", padx=(8,4))
+        self._write_log_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(btn_row, text="写入日志文件", variable=self._write_log_var,
+                       bg=PANEL, fg=TEXT, font=("Segoe UI", 10),
+                       activebackground=PANEL, selectcolor=PANEL).pack(side="left")
+        # default log file path
+        try:
+            self._log_file = Path.home() / ".file_renamer.log"
+        except Exception:
+            self._log_file = None
 
         log_wrap = tk.Frame(inner, bg=PANEL)
         log_wrap.pack(fill="both", expand=True)
@@ -240,6 +260,14 @@ class LogMixin:
         self._log_w.insert("end", msg + "\n", tag)
         self._log_w.see("end")
         self._log_w.config(state="disabled")
+        # optionally append to a log file
+        try:
+            if getattr(self, "_write_log_var", None) and self._write_log_var.get() and self._log_file:
+                with open(self._log_file, "a", encoding="utf-8") as f:
+                    ts = datetime.now().isoformat(sep=' ', timespec='seconds')
+                    f.write(f"[{ts}] {tag.upper():5} {msg}\n")
+        except Exception:
+            pass
 
     def _clear_log(self):
         self._log_w.config(state="normal")
@@ -261,7 +289,7 @@ class OpRow(tk.Frame):
         后标  [删除输入框]  [增加输入框]
     执行顺序固定：先删旧 → 再加新，前标先于后标。
     """
-    TYPES = ["前后标编辑", "查找替换", "序号规范化", "数字补位"]
+    TYPES = ["查找替换", "序号规范化", "数字补位", "前后标编辑"]
 
     def __init__(self, parent, on_delete, on_move, refresh_preview, **kw):
         super().__init__(parent, bg=PANEL,
@@ -587,6 +615,19 @@ class RenameTab(tk.Frame, LogMixin):
             (p, self._compute_new_name(p)) for p in self._files
         ]
 
+        # 如果是 dry-run，仅记录计划并返回
+        if getattr(self, '_dryrun_var', None) and self._dryrun_var.get():
+            ok = skip = 0
+            self.log("─"*60, "head")
+            for path, new_name in plan:
+                if new_name == path.name:
+                    self.log(f"  ·  {path.name}  （无变化，跳过）", "info"); skip += 1
+                else:
+                    self.log(f"  ⟳  DRY RUN: {path.name}  →  {new_name}", "info"); ok += 1
+            self.log(f"DRY RUN 完成：计划变更 {ok}  跳过 {skip}", "head")
+            self.log("─"*60, "head")
+            return
+
         ok = skip = err = 0
         self.log("─"*60, "head")
 
@@ -598,7 +639,8 @@ class RenameTab(tk.Frame, LogMixin):
                 skip += 1; continue
             tmp = path.parent / f"__tmp_{uuid.uuid4().hex}{path.suffix}"
             try:
-                path.rename(tmp)
+                # use shutil.move for cross-filesystem safety
+                shutil.move(str(path), str(tmp))
                 temp_map.append((tmp, path, new_name))
             except Exception as e:
                 self.log(f"  ✗  {path.name}  临时重命名失败: {e}", "err"); err += 1
@@ -609,12 +651,13 @@ class RenameTab(tk.Frame, LogMixin):
             try:
                 if dst.exists():
                     dst = self._resolve_conflict(dst)
-                tmp.rename(dst)
+                # use shutil.move to handle cross-device moves
+                shutil.move(str(tmp), str(dst))
                 self.log(f"  ✓  {orig_path.name}  →  {dst.name}", "ok"); ok += 1
             except Exception as e:
                 # 回滚：把临时文件改回原名
                 try:
-                    tmp.rename(orig_path)
+                    shutil.move(str(tmp), str(orig_path))
                     self.log(f"  ✗  {orig_path.name}  重命名失败（已回滚）: {e}", "err")
                 except Exception as e2:
                     self.log(f"  ✗  {orig_path.name}  重命名失败且回滚失败: {e} | 回滚错误: {e2}", "err")
@@ -791,9 +834,14 @@ class ExtTab(tk.Frame, LogMixin):
             try:
                 dst_dir.mkdir(parents=True, exist_ok=True)
                 if dst_path.exists(): dst_path = self._resolve(dst_path)
-                if keep:          shutil.copy2(str(path), str(dst_path)); act = f"复制 → {dst_path}"
-                elif dst_folder:  shutil.move(str(path), str(dst_path));  act = f"移动 → {dst_path}"
-                else:             path.rename(dst_path);                   act = f"重命名 → {dst_path.name}"
+                if keep:
+                    shutil.copy2(str(path), str(dst_path)); act = f"复制 → {dst_path}"
+                elif dst_folder:
+                    # move to folder (possibly across filesystems)
+                    shutil.move(str(path), str(dst_path));  act = f"移动 → {dst_path}"
+                else:
+                    # rename/move in-place; use shutil.move for cross-device robustness
+                    shutil.move(str(path), str(dst_path));                   act = f"重命名 → {dst_path.name}"
                 self.log(f"  ✓  {path.name}  →  {act}", "ok"); ok+=1
             except Exception as e:
                 self.log(f"  ✗  {path.name}  错误: {e}", "err"); err+=1
@@ -989,8 +1037,11 @@ class SubTab(tk.Frame, LogMixin):
             dst = sub.parent / target_name
             try:
                 if dst.exists(): dst = self._resolve(dst)
-                if keep: shutil.copy2(str(sub), str(dst)); act = f"复制 → {dst.name}"
-                else:    sub.rename(dst);                   act = f"重命名 → {dst.name}"
+                if keep:
+                    shutil.copy2(str(sub), str(dst)); act = f"复制 → {dst.name}"
+                else:
+                    # use shutil.move to support cross-device moves
+                    shutil.move(str(sub), str(dst));                   act = f"重命名 → {dst.name}"
                 self.log(f"  ✓  {sub.name}  →  {act}", "ok"); ok += 1
             except Exception as e:
                 self.log(f"  ✗  {sub.name}  错误: {e}", "err"); err += 1
@@ -1026,8 +1077,35 @@ class App(_Base):
         self._build()
 
     def _build(self):
-        # 标题
-        hdr = tk.Frame(self, bg=BG)
+        # 使用可滚动容器包裹主内容（标题 + Notebook），以便在窗口较小时可以纵向滚动
+        container = tk.Frame(self, bg=BG)
+        container.pack(fill="both", expand=True)
+
+        canvas = tk.Canvas(container, bg=BG, highlightthickness=0)
+        vbar = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vbar.set)
+        vbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        inner = tk.Frame(canvas, bg=BG)
+        win_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _on_inner_config(e):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        inner.bind("<Configure>", _on_inner_config)
+
+        def _on_canvas_config(e):
+            # 保持内层宽度与 canvas 宽度一致，避免水平滚动
+            canvas.itemconfig(win_id, width=e.width)
+        canvas.bind("<Configure>", _on_canvas_config)
+
+        # 鼠标滚轮支持（Windows）
+        def _on_mousewheel(e):
+            canvas.yview_scroll(-int(e.delta / 120), "units")
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+        # 标题（放到可滚动区域内）
+        hdr = tk.Frame(inner, bg=BG)
         hdr.pack(fill="x", padx=20, pady=(16, 0))
         tk.Label(hdr, text="文件名管理工具", bg=BG, fg=TEXT,
                  font=("Segoe UI", 14, "bold")).pack(anchor="w")
@@ -1044,7 +1122,7 @@ class App(_Base):
                   background=[("selected", PANEL)],
                   foreground=[("selected", TEXT)])
 
-        nb = ttk.Notebook(self)
+        nb = ttk.Notebook(inner)
         nb.pack(fill="both", expand=True, padx=4, pady=(10, 4))
 
         t1 = RenameTab(nb); nb.add(t1, text="  通用重命名  ")
