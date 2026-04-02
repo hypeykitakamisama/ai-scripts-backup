@@ -270,6 +270,9 @@ textarea::placeholder { color: #b0a898; }
 }
 .omit-toggle input[type=checkbox] { accent-color: var(--accent); }
 
+.omit-toggle.compact { gap: 2px; font-size: 11px; margin-left: 0px; }
+.omit-toggle.compact input[type=checkbox] { margin: 0; width: 14px; height: 14px; }
+
 /* Add custom scene */
 .add-custom {
   background: var(--surface);
@@ -399,7 +402,7 @@ textarea::placeholder { color: #b0a898; }
 
 <header>
   <div class="header-left">
-    <h1>台詞翻訳表 · 编辑器</h1>
+    <h1>台词翻译表 · 编辑器</h1>
     <p>Wiki 台词翻译表模板生成工具</p>
   </div>
 </header>
@@ -416,6 +419,9 @@ textarea::placeholder { color: #b0a898; }
       <button class="filter-btn" onclick="setFilter('complete', this)">已完成</button>
       <button class="filter-btn" onclick="setFilter('partial', this)">部分缺失</button>
       <button class="filter-btn" onclick="setFilter('empty', this)">全部缺失</button>
+      <label class="omit-toggle compact">
+        <input type="checkbox" id="ignoreOmitted" onchange="toggleIgnoreOmitted(this.checked)" /> 隐藏省略内容
+      </label>
     </div>
     <span class="stats" id="stats"></span>
     <div class="sep"></div>
@@ -438,26 +444,31 @@ textarea::placeholder { color: #b0a898; }
   <!-- Entry list: 常规场合 -->
   <div class="group-header">
     <span class="group-title">常规台词</span>
+    <button id="toggleMainBtn" class="btn btn-ghost" style="font-size:11px;padding:4px 8px;margin-left:8px;" onclick="toggleGroup('main')">折叠</button>
     <span class="group-count" id="groupCountMain"></span>
     <button class="btn btn-ghost" style="font-size:11px;padding:4px 10px;" onclick="batchOmit('main', true)">全部省略</button>
     <button class="btn btn-ghost" style="font-size:11px;padding:4px 10px;" onclick="batchOmit('main', false)">取消省略</button>
   </div>
   <div id="entryListMain"></div>
-
   <!-- Entry list: 时报 -->
   <div class="group-header" style="margin-top:8px;">
     <span class="group-title">时报</span>
+    <button id="toggleHourBtn" class="btn btn-ghost" style="font-size:11px;padding:4px 8px;margin-left:8px;" onclick="toggleGroup('hour')">折叠</button>
     <span class="group-count" id="groupCountHour"></span>
     <button class="btn btn-ghost" style="font-size:11px;padding:4px 10px;" onclick="batchOmit('hour', true)">全部省略</button>
     <button class="btn btn-ghost" style="font-size:11px;padding:4px 10px;" onclick="batchOmit('hour', false)">取消省略</button>
   </div>
   <div id="entryListHour"></div>
+  
+  <!-- Custom groups will be rendered here (moved below hour to keep them at page bottom) -->
+  <div id="customGroupsContainer"></div>
 
   <!-- Add custom scene -->
   <div class="add-custom">
     <span style="font-size:12px;color:var(--muted);white-space:nowrap;">添加自定义场合</span>
-    <input type="text" id="customSuffix" placeholder="档名后缀，如 Xmas2024" />
-    <input type="text" id="customLabel" placeholder="场合名称，如 圣诞节" />
+    <input type="text" id="customSuffix" style="width:200px;" placeholder="档名后缀，如 Xmas2024" />
+    <input type="text" id="customLabel" style="width:200px;" placeholder="场合名称，如 圣诞节" />
+    <input type="text" id="customGroup" style="width:200px;" placeholder="分组名（留空则为场合名）" />
     <button class="btn btn-ghost" onclick="addCustomScene()">＋ 添加</button>
   </div>
 
@@ -466,7 +477,8 @@ textarea::placeholder { color: #b0a898; }
     <div class="output-header">
       <h3>生成结果</h3>
       <span class="copy-hint" id="copyHint">已复制！</span>
-      <button class="btn btn-accent" onclick="copyOutput()">复制全部</button>
+        <button class="btn btn-accent" onclick="copyOutput()">复制全部</button>
+        <button class="btn btn-ghost" style="margin-left:8px;" onclick="exportTxt()">导出为 txt</button>
     </div>
     <div class="output-code" id="outputCode"></div>
   </div>
@@ -523,13 +535,22 @@ const BASE_SCENES = [
 ];
 
 // ── State ─────────────────────────────────────────────────
+// 初始分组：main 与 hour（hour 在 BASE_SCENES 中为 4 位后缀）
+let groups = ['main', 'hour'];
+
 let scenes = BASE_SCENES.map(s => ({
   ...s,
+  group: (/^\d{4}$/.test(s.suffix) ? 'hour' : 'main'),
   jp: '',
   zh: '',
   omit: false,   // 标记为"此条不存在，整体省略"
   collapsed: true,
 }));
+
+// Group-level collapse state (通用映射，包含 main/hour 与自定义组)
+let groupCollapsed = { main: false, hour: false };
+// 是否在列表/统计中忽略已标记为省略的项
+let ignoreOmitted = false;
 
 let currentFilter = 'all';
 let charId = '';
@@ -540,7 +561,10 @@ const LS_KEY = 'wiki_editor_state';
 function saveState() {
   const data = {
     charId,
-    scenes: scenes.map(s => ({ suffix: s.suffix, jp: s.jp, zh: s.zh, omit: s.omit, collapsed: s.collapsed }))
+    scenes: scenes.map(s => ({ suffix: s.suffix, jp: s.jp, zh: s.zh, omit: s.omit, collapsed: s.collapsed, group: s.group })),
+    groups,
+    groupCollapsed,
+    ignoreOmitted,
   };
   localStorage.setItem(LS_KEY, JSON.stringify(data));
 }
@@ -562,12 +586,33 @@ function loadState() {
           found.zh = saved.zh || '';
           found.omit = saved.omit || false;
           found.collapsed = saved.collapsed || false;
+          if (saved.group) found.group = saved.group;
         } else {
           // custom scene
-          scenes.push({ suffix: saved.suffix, label: saved.suffix, jp: saved.jp || '', zh: saved.zh || '', omit: saved.omit || false, collapsed: saved.collapsed ?? true, custom: true });
+          scenes.push({ suffix: saved.suffix, label: saved.suffix, jp: saved.jp || '', zh: saved.zh || '', omit: saved.omit || false, collapsed: saved.collapsed ?? true, custom: true, group: saved.group || 'main' });
         }
       });
     }
+    // load custom groups (from explicit groups list or infer from scenes)
+    if (Array.isArray(data.groups)) {
+      // keep saved order but ensure 'main' and 'hour' present at front
+      const extras = data.groups.filter(g => g !== 'main' && g !== 'hour');
+      groups = ['main', 'hour', ...extras.filter((v, i, a) => a.indexOf(v) === i)];
+    } else {
+      // infer groups from scenes: main, hour, then other groups
+      const foundGroups = Array.from(new Set(scenes.map(s => s.group || 'main'))).filter(g => g !== 'main' && g !== 'hour');
+      groups = ['main', 'hour', ...foundGroups];
+    }
+    // load group collapse flags (ensure keys exist)
+    if (data.groupCollapsed && typeof data.groupCollapsed === 'object') {
+      groupCollapsed = { ...groupCollapsed, ...data.groupCollapsed };
+    }
+    // ensure groupCollapsed has entries for any inferred groups
+    groups.forEach(g => { if (typeof groupCollapsed[g] === 'undefined') groupCollapsed[g] = false; });
+    // load ignoreOmitted
+    if (typeof data.ignoreOmitted !== 'undefined') ignoreOmitted = !!data.ignoreOmitted;
+    // set checkbox UI
+    const ioEl = document.getElementById('ignoreOmitted'); if (ioEl) ioEl.checked = ignoreOmitted;
   } catch(e) {}
 }
 
@@ -601,8 +646,8 @@ function filename(scene) {
 }
 
 function updateStats() {
-  const total = scenes.filter(s => !s.omit).length;
-  const done = scenes.filter(s => getStatus(s) === 'complete').length;
+  const total = scenes.filter(s => !ignoreOmitted || !s.omit).length;
+  const done = scenes.filter(s => (!ignoreOmitted || !s.omit) && getStatus(s) === 'complete').length;
   document.getElementById('stats').textContent = `${done} / ${total} 已完成`;
 }
 
@@ -617,6 +662,7 @@ function renderGroup(sceneList, containerId) {
   container.innerHTML = '';
 
   const filtered = sceneList.filter(s => {
+    if (ignoreOmitted && s.omit) return false;
     if (currentFilter === 'all') return true;
     const st = getStatus(s);
     if (currentFilter === 'complete') return st === 'complete';
@@ -668,29 +714,89 @@ function renderGroup(sceneList, containerId) {
 }
 
 function renderAll() {
-  const mainScenes = scenes.filter(s => !isHourly(s));
-  const hourScenes = scenes.filter(s => isHourly(s));
+  const mainScenes = scenes.filter(s => s.group === 'main');
+  const hourScenes = scenes.filter(s => s.group === 'hour');
 
+  // Render main group (always present)
   renderGroup(mainScenes, 'entryListMain');
+
+  // Render hour group (always present)
   renderGroup(hourScenes, 'entryListHour');
 
-  // Update group counts
-  const mainDone = mainScenes.filter(s => getStatus(s) === 'complete').length;
-  const hourDone = hourScenes.filter(s => getStatus(s) === 'complete').length;
+  // Render custom groups (only show groups that have items) — after hour so they appear at the bottom
+  const customContainer = document.getElementById('customGroupsContainer');
+  customContainer.innerHTML = '';
+  groups.forEach(g => {
+    if (g === 'main' || g === 'hour') return;
+    const scenesInGroup = scenes.filter(s => s.group === g);
+    if (scenesInGroup.length === 0) return; // do not render empty custom group
+
+    const safe = g.replace(/\W+/g, '_');
+    const header = document.createElement('div');
+    header.className = 'group-header';
+    header.style.marginTop = '8px';
+    header.innerHTML = `
+      <span class="group-title">${g}</span>
+      <button class="btn btn-ghost" style="font-size:11px;padding:4px 8px;margin-left:8px;" onclick="toggleGroup('${g}')">${groupCollapsed[g] ? '展开' : '折叠'}</button>
+      <span class="group-count" id="groupCount_${safe}"></span>
+      <button class="btn btn-ghost" style="font-size:11px;padding:4px 10px;" onclick="batchOmit('${g}', true)">全部省略</button>
+      <button class="btn btn-ghost" style="font-size:11px;padding:4px 10px;" onclick="batchOmit('${g}', false)">取消省略</button>
+    `;
+    const list = document.createElement('div');
+    list.id = `entryListGroup_${safe}`;
+    list.style.marginBottom = '6px';
+    // apply collapse state for this custom group
+    list.style.display = groupCollapsed[g] ? 'none' : 'block';
+    customContainer.appendChild(header);
+    customContainer.appendChild(list);
+    renderGroup(scenesInGroup, list.id);
+
+    // update count for this custom group (respect ignoreOmitted)
+    const visibleItems = scenesInGroup.filter(s => !ignoreOmitted || !s.omit);
+    const done = visibleItems.filter(s => getStatus(s) === 'complete').length;
+    const omit = scenesInGroup.filter(s => s.omit).length;
+    const countEl = document.getElementById(`groupCount_${safe}`);
+    if (countEl) countEl.textContent = `${done}/${visibleItems.length} 已完成` + (omit ? `，${omit} 项省略` : '');
+  });
+
+  // Update group counts for main/hour (respect ignoreOmitted)
+  const visibleMain = mainScenes.filter(s => !ignoreOmitted || !s.omit);
+  const visibleHour = hourScenes.filter(s => !ignoreOmitted || !s.omit);
+  const mainDone = visibleMain.filter(s => getStatus(s) === 'complete').length;
+  const hourDone = visibleHour.filter(s => getStatus(s) === 'complete').length;
   const mainOmit = mainScenes.filter(s => s.omit).length;
   const hourOmit = hourScenes.filter(s => s.omit).length;
   document.getElementById('groupCountMain').textContent =
-    `${mainDone}/${mainScenes.length} 已完成` + (mainOmit ? `，${mainOmit} 项省略` : '');
+    `${mainDone}/${visibleMain.length} 已完成` + (mainOmit ? `，${mainOmit} 项省略` : '');
   document.getElementById('groupCountHour').textContent =
-    `${hourDone}/${hourScenes.length} 已完成` + (hourOmit ? `，${hourOmit} 项省略` : '');
+    `${hourDone}/${visibleHour.length} 已完成` + (hourOmit ? `，${hourOmit} 项省略` : '');
 
   updateStats();
+
+  // Apply group-level collapse state
+  const mainContainer = document.getElementById('entryListMain');
+  const hourContainer = document.getElementById('entryListHour');
+  const toggleMainBtn = document.getElementById('toggleMainBtn');
+  const toggleHourBtn = document.getElementById('toggleHourBtn');
+  if (mainContainer) {
+    mainContainer.style.display = groupCollapsed.main ? 'none' : 'block';
+    if (toggleMainBtn) toggleMainBtn.textContent = groupCollapsed.main ? '展开' : '折叠';
+  }
+  if (hourContainer) {
+    hourContainer.style.display = groupCollapsed.hour ? 'none' : 'block';
+    if (toggleHourBtn) toggleHourBtn.textContent = groupCollapsed.hour ? '展开' : '折叠';
+  }
 }
 
 function batchOmit(group, val) {
   scenes.forEach(s => {
-    if (group === 'hour' && isHourly(s)) s.omit = val;
-    if (group === 'main' && !isHourly(s) && !s.custom) s.omit = val;
+    if (group === 'hour') {
+      if (s.group === 'hour') s.omit = val;
+    } else if (group === 'main') {
+      if (s.group === 'main') s.omit = val;
+    } else {
+      if (s.group === group) s.omit = val;
+    }
   });
   saveState();
   renderAll();
@@ -698,6 +804,20 @@ function batchOmit(group, val) {
 
 function toggleCollapse(idx) {
   scenes[idx].collapsed = !scenes[idx].collapsed;
+  saveState();
+  renderAll();
+}
+
+function toggleGroup(group) {
+  // toggle a group's collapsed state (works for main/hour/custom)
+  if (!groupCollapsed.hasOwnProperty(group)) groupCollapsed[group] = false;
+  groupCollapsed[group] = !groupCollapsed[group];
+  saveState();
+  renderAll();
+}
+
+function toggleIgnoreOmitted(val) {
+  ignoreOmitted = !!val;
   saveState();
   renderAll();
 }
@@ -751,11 +871,22 @@ function onCharIdChange() {
 function addCustomScene() {
   const suffix = document.getElementById('customSuffix').value.trim();
   const label = document.getElementById('customLabel').value.trim();
+  const groupInput = document.getElementById('customGroup').value.trim();
+  // 如果未填写分组名，则使用场合名称作为默认分组
+  const groupName = groupInput || label;
   if (!suffix || !label) { alert('请填写档名后缀和场合名称'); return; }
   if (scenes.find(s => s.suffix === suffix)) { alert('该档名后缀已存在'); return; }
-  scenes.push({ suffix, label, jp: '', zh: '', omit: false, collapsed: false, custom: true });
+  // ensure group exists (insert before 'hour')
+  if (!groups.includes(groupName)) {
+    // append new custom group at the end (new groups show at bottom)
+    groups.push(groupName);
+    // initialize collapse state for the new group
+    if (typeof groupCollapsed[groupName] === 'undefined') groupCollapsed[groupName] = false;
+  }
+  scenes.push({ suffix, label, jp: '', zh: '', omit: false, collapsed: false, custom: true, group: groupName });
   document.getElementById('customSuffix').value = '';
   document.getElementById('customLabel').value = '';
+  document.getElementById('customGroup').value = '';
   saveState();
   renderAll();
 }
@@ -795,6 +926,22 @@ function copyOutput() {
     hint.style.opacity = '1';
     setTimeout(() => hint.style.opacity = '0', 2000);
   });
+}
+
+function exportTxt() {
+  const text = document.getElementById('outputCode').textContent || '';
+  if (!text) { alert('当前没有生成内容可导出'); return; }
+  const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  const safeId = (charId || '台词翻译表').replace(/[\\/:*?"<>|]/g, '_');
+  const filename = `${safeId}.txt`;
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 function showClearConfirm() {

@@ -1,10 +1,42 @@
-# PyInstaller 打包产物
-dist/
-build/
-*.spec
-*.exe
-# 虚拟环境文件夹
+# --- 安全与配置 ---
+.env
+.env.local
+.env.*
+secrets.ini
+*.log
+config.json
+
+# --- Python 缓存与运行 ---
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+
+# --- 虚拟环境 ---
 venv/
 .venv/
 env/
 ENV/
+bin/
+lib/
+include/
+
+# --- PyInstaller 打包产物 ---
+dist/
+build/
+*.spec
+*.exe
+
+# --- 编辑器与系统文件 ---
+.vscode/
+.vs/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# --- 临时文件 ---
+temp/
+tmp/
+*.tmp
